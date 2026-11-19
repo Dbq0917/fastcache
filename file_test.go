@@ -4,10 +4,13 @@ import (
 	"errors"
 	"fmt"
 	"io/ioutil"
+	"math/rand"
 	"os"
 	"path/filepath"
 	"sync"
 	"testing"
+
+	xxhash "github.com/cespare/xxhash/v2"
 )
 
 func TestSaveLoadSmall(t *testing.T) {
@@ -258,4 +261,114 @@ func TestSaveLoadConcurrent(t *testing.T) {
 
 	close(stopCh)
 	wgWorkers.Wait()
+}
+
+func TestSaveToFileShrinksAfterDeleteAndWrite(t *testing.T) {
+	const maxChunks = 8
+	c := New(bucketsCount * maxChunks * chunkSize)
+	defer c.Reset()
+	bucketIdx := xxhash.Sum64([]byte("key-000000")) % bucketsCount
+	b := &c.buckets[bucketIdx]
+
+	rnd := rand.New(rand.NewSource(1))
+	value := make([]byte, 1024)
+	var keys [][]byte
+	var hashes []uint64
+	for i := 0; b.chunksCount < 4; i++ {
+		k := []byte(fmt.Sprintf("key-%06d", i))
+		h := xxhash.Sum64(k)
+		if h%bucketsCount != bucketIdx {
+			continue
+		}
+		if _, err := rnd.Read(value); err != nil {
+			t.Fatalf("cannot generate value: %s", err)
+		}
+		b.Set(k, value, h)
+		keys = append(keys, k)
+		hashes = append(hashes, h)
+	}
+
+	tmpDir, err := ioutil.TempDir("", "fastcache-file-size")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer os.RemoveAll(tmpDir)
+
+	fillPath := filepath.Join(tmpDir, "fill.fastcache")
+	if err := c.SaveToFile(fillPath); err != nil {
+		t.Fatalf("cannot save filled cache: %s", err)
+	}
+	fillSize := getFileSize(t, fillPath)
+
+	for i := range keys {
+		if i%4 != 0 {
+			b.Del(hashes[i])
+		}
+	}
+	deletePath := filepath.Join(tmpDir, "delete.fastcache")
+	if err := c.SaveToFile(deletePath); err != nil {
+		t.Fatalf("cannot save cache after deletion: %s", err)
+	}
+	deleteSize := getFileSize(t, deletePath)
+	if deleteSize*4 >= fillSize*3 {
+		t.Fatalf("cache file was not reclaimed after deletion; fillSize=%d; deleteSize=%d", fillSize, deleteSize)
+	}
+
+	newKeys := make([][]byte, 0, len(keys)/2)
+	for i := 0; len(newKeys) < len(keys)/2; i++ {
+		k := []byte(fmt.Sprintf("new-key-%06d", i))
+		h := xxhash.Sum64(k)
+		if h%bucketsCount != bucketIdx {
+			continue
+		}
+		if _, err := rnd.Read(value); err != nil {
+			t.Fatalf("cannot generate value: %s", err)
+		}
+		b.Set(k, value, h)
+		newKeys = append(newKeys, k)
+	}
+	writePath := filepath.Join(tmpDir, "write.fastcache")
+	if err := c.SaveToFile(writePath); err != nil {
+		t.Fatalf("cannot save cache after writes: %s", err)
+	}
+	writeSize := getFileSize(t, writePath)
+	t.Logf("file size curve: fill=%d delete=%d write=%d", fillSize, deleteSize, writeSize)
+
+	c2, err := LoadFromFile(writePath)
+	if err != nil {
+		t.Fatalf("cannot load cache after writes: %s", err)
+	}
+	defer c2.Reset()
+	for i := range keys {
+		got := c2.Get(nil, keys[i])
+		if i%4 == 0 {
+			if len(got) != len(value) {
+				t.Fatalf("cannot read live key %q after reload; got len=%d; want=%d", keys[i], len(got), len(value))
+			}
+		} else if len(got) != 0 {
+			t.Fatalf("deleted key %q is readable after reload", keys[i])
+		}
+	}
+	for _, k := range newKeys {
+		if got := c2.Get(nil, k); len(got) != len(value) {
+			t.Fatalf("cannot read new key %q after reload; got len=%d; want=%d", k, len(got), len(value))
+		}
+	}
+}
+
+func getFileSize(t *testing.T, filePath string) int64 {
+	t.Helper()
+	var size int64
+	if err := filepath.Walk(filePath, func(_ string, info os.FileInfo, err error) error {
+		if err != nil {
+			return err
+		}
+		if info.Mode().IsRegular() {
+			size += info.Size()
+		}
+		return nil
+	}); err != nil {
+		t.Fatalf("cannot calculate size of %q: %s", filePath, err)
+	}
+	return size
 }

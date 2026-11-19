@@ -285,3 +285,192 @@ func TestCacheResetUpdateStatsSetConcurrent(t *testing.T) {
 	statsWG.Wait()
 	resettersWG.Wait()
 }
+
+func TestBucketCompactionReclaimsChunks(t *testing.T) {
+	var b bucket
+	b.Init(4 * chunkSize)
+	defer b.Reset()
+
+	var keys [][]byte
+	var hashes []uint64
+	for i := 0; b.chunksCount < 4; i++ {
+		k := []byte(fmt.Sprintf("key-%06d", i))
+		v := make([]byte, 1024)
+		for j := range v {
+			v[j] = byte(i)
+		}
+		h := uint64(i + 1)
+		b.Set(k, v, h)
+		keys = append(keys, k)
+		hashes = append(hashes, h)
+	}
+	chunksBefore := b.chunksCount
+
+	for i := range keys {
+		if i%8 != 0 {
+			b.Del(hashes[i])
+		}
+	}
+	if b.chunksCount != 1 {
+		t.Fatalf("unexpected chunksCount after deleting entries; got %d; want 1; chunksBefore=%d", b.chunksCount, chunksBefore)
+	}
+	if b.liveBytes >= chunkSize {
+		t.Fatalf("unexpected liveBytes after compaction; got %d; want less than %d", b.liveBytes, chunkSize)
+	}
+	for i := range keys {
+		v, ok := b.Get(nil, keys[i], hashes[i], true)
+		if i%8 == 0 {
+			if !ok || len(v) != 1024 || v[0] != byte(i) {
+				t.Fatalf("cannot read live entry %d after compaction; ok=%v; len(v)=%d", i, ok, len(v))
+			}
+		} else if ok {
+			t.Fatalf("deleted entry %d is still readable after compaction", i)
+		}
+	}
+}
+
+func TestBucketCompactionPreservesWrappedEntries(t *testing.T) {
+	var b bucket
+	b.Init(3 * chunkSize)
+	defer b.Reset()
+
+	var oldKey, oldValue []byte
+	var oldHash uint64
+	for i := 0; b.gen == 1; i++ {
+		k := []byte(fmt.Sprintf("old-key-%06d", i))
+		v := make([]byte, 2048)
+		for j := range v {
+			v[j] = byte(i)
+		}
+		h := uint64(i + 1)
+		b.Set(k, v, h)
+		if b.gen == 1 {
+			oldKey, oldValue, oldHash = k, v, h
+		}
+	}
+	for i := 0; i < 40; i++ {
+		k := []byte(fmt.Sprintf("new-key-%06d", i))
+		v := []byte(fmt.Sprintf("new-value-%06d", i))
+		b.Set(k, v, uint64(1_000_000+i))
+	}
+	for h := uint64(2); h < 1_000_000; h++ {
+		if h == oldHash {
+			continue
+		}
+		b.Del(h)
+	}
+	if v, ok := b.Get(nil, oldKey, oldHash, true); !ok || string(v) != string(oldValue) {
+		t.Fatalf("cannot read wrapped entry after compaction; ok=%v; len(v)=%d; want len(v)=%d", ok, len(v), len(oldValue))
+	}
+	for i := 0; i < 40; i++ {
+		k := []byte(fmt.Sprintf("new-key-%06d", i))
+		v := []byte(fmt.Sprintf("new-value-%06d", i))
+		if got, ok := b.Get(nil, k, uint64(1_000_000+i), true); !ok || string(got) != string(v) {
+			t.Fatalf("cannot read current entry %d after compaction; ok=%v; got=%q; want=%q", i, ok, got, v)
+		}
+	}
+	if b.chunksCount > 2 {
+		t.Fatalf("unexpected chunksCount after compaction; got %d; want at most 2", b.chunksCount)
+	}
+}
+
+func TestBucketCompactionConcurrentReadWrite(t *testing.T) {
+	var b bucket
+	b.Init(32 * chunkSize)
+	defer b.Reset()
+
+	const entriesCount = 800
+	keys := make([][]byte, entriesCount)
+	values := make([][]byte, entriesCount)
+	hashes := make([]uint64, entriesCount)
+	for i := range entriesCount {
+		keys[i] = []byte(fmt.Sprintf("key-%06d", i))
+		values[i] = []byte(fmt.Sprintf("value-%06d", i))
+		hashes[i] = uint64(i + 1)
+		b.Set(keys[i], values[i], hashes[i])
+	}
+
+	errCh := make(chan error, 1)
+	startCh := make(chan struct{})
+	var wg sync.WaitGroup
+
+	for range 4 {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			<-startCh
+			for range 100 {
+				for i := 0; i < entriesCount; i += 16 {
+					v, ok := b.Get(nil, keys[i], hashes[i], true)
+					if !ok || string(v) != string(values[i]) {
+						select {
+						case errCh <- fmt.Errorf("read returned empty value for live key %q during compaction", keys[i]):
+						default:
+						}
+						return
+					}
+				}
+			}
+		}()
+	}
+
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		<-startCh
+		for i := 0; i < entriesCount; i++ {
+			if i%16 != 0 {
+				b.Del(hashes[i])
+			}
+		}
+	}()
+
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		<-startCh
+		for i := range 400 {
+			k := []byte(fmt.Sprintf("write-key-%06d", i))
+			v := []byte(fmt.Sprintf("write-value-%06d", i))
+			h := uint64(2_000_000 + i)
+			b.Set(k, v, h)
+			if got, ok := b.Get(nil, k, h, true); !ok || string(got) != string(v) {
+				select {
+				case errCh <- fmt.Errorf("write was lost for key %q during compaction", k):
+				default:
+				}
+				return
+			}
+		}
+	}()
+
+	close(startCh)
+	doneCh := make(chan struct{})
+	go func() {
+		wg.Wait()
+		close(doneCh)
+	}()
+	select {
+	case <-doneCh:
+	case <-time.After(10 * time.Second):
+		t.Fatalf("concurrent reads/writes blocked during compaction")
+	}
+	select {
+	case err := <-errCh:
+		t.Fatal(err)
+	default:
+	}
+
+	for i := 0; i < entriesCount; i += 16 {
+		if v, ok := b.Get(nil, keys[i], hashes[i], true); !ok || string(v) != string(values[i]) {
+			t.Fatalf("live key %q was lost after compaction; ok=%v", keys[i], ok)
+		}
+	}
+	for i := range 400 {
+		k := []byte(fmt.Sprintf("write-key-%06d", i))
+		v := []byte(fmt.Sprintf("write-value-%06d", i))
+		if got, ok := b.Get(nil, k, uint64(2_000_000+i), true); !ok || string(got) != string(v) {
+			t.Fatalf("written key %q was lost after compaction; ok=%v", k, ok)
+		}
+	}
+}

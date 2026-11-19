@@ -5,6 +5,7 @@ package fastcache
 
 import (
 	"fmt"
+	"sort"
 	"sync"
 	"sync/atomic"
 
@@ -234,6 +235,18 @@ type bucket struct {
 	// idx points to chunks for writing the next (k, v) pair.
 	idx uint64
 
+	// liveBytes is the total size of encoded live entries in chunks.
+	liveBytes uint64
+
+	// chunksCount is the number of allocated chunks.
+	chunksCount uint64
+
+	// compactNoop is set when compaction cannot release a chunk for the
+	// current chunksCount and liveBytes values.
+	compactNoop          bool
+	compactNoopBytes     uint64
+	compactNoopLiveBytes uint64
+
 	collisions  uint64
 	corruptions uint64
 }
@@ -261,6 +274,11 @@ func (b *bucket) Reset() {
 	b.m = make(map[uint64]uint64)
 	b.idx = 0
 	b.gen = 1
+	b.liveBytes = 0
+	b.chunksCount = 0
+	b.compactNoop = false
+	b.compactNoopBytes = 0
+	b.compactNoopLiveBytes = 0
 	atomic.StoreUint64(&b.getCalls, 0)
 	atomic.StoreUint64(&b.setCalls, 0)
 	atomic.StoreUint64(&b.misses, 0)
@@ -270,15 +288,13 @@ func (b *bucket) Reset() {
 }
 
 func (b *bucket) cleanLocked() {
-	bGen := b.gen & ((1 << genSizeBits) - 1)
-	bIdx := b.idx
 	bm := b.m
 	newItems := 0
+	newBytes := uint64(0)
 	for _, v := range bm {
-		gen := v >> bucketSizeBits
-		idx := v & ((1 << bucketSizeBits) - 1)
-		if (gen+1 == bGen || gen == maxGen && bGen == 1) && idx >= bIdx || gen == bGen && idx < bIdx {
+		if n, ok := b.entryLenAtPosLocked(v); ok {
 			newItems++
+			newBytes += n
 		}
 	}
 	if newItems < len(bm) {
@@ -287,14 +303,171 @@ func (b *bucket) cleanLocked() {
 		// See https://github.com/VictoriaMetrics/VictoriaMetrics/issues/5379
 		bmNew := make(map[uint64]uint64, newItems)
 		for k, v := range bm {
-			gen := v >> bucketSizeBits
-			idx := v & ((1 << bucketSizeBits) - 1)
-			if (gen+1 == bGen || gen == maxGen && bGen == 1) && idx >= bIdx || gen == bGen && idx < bIdx {
+			if _, ok := b.entryLenAtPosLocked(v); ok {
 				bmNew[k] = v
 			}
 		}
 		b.m = bmNew
 	}
+	b.liveBytes = newBytes
+	b.compactNoop = false
+}
+
+func (b *bucket) entryLenAtPosLocked(v uint64) (uint64, bool) {
+	gen := v >> bucketSizeBits
+	idx := v & ((1 << bucketSizeBits) - 1)
+	bGen := b.gen & ((1 << genSizeBits) - 1)
+	if !((gen == bGen && idx < b.idx) || (gen+1 == bGen && idx >= b.idx) || (gen == maxGen && bGen == 1 && idx >= b.idx)) {
+		return 0, false
+	}
+	chunkIdx := idx / chunkSize
+	if chunkIdx >= uint64(len(b.chunks)) {
+		return 0, false
+	}
+	chunk := b.chunks[chunkIdx]
+	if chunk == nil {
+		return 0, false
+	}
+	off := idx % chunkSize
+	chunkCap := uint64(cap(chunk))
+	if off+4 >= chunkSize || off+4 > chunkCap {
+		return 0, false
+	}
+	kvLenBuf := chunk[off : off+4]
+	keyLen := uint64(kvLenBuf[0])<<8 | uint64(kvLenBuf[1])
+	valLen := uint64(kvLenBuf[2])<<8 | uint64(kvLenBuf[3])
+	entryLen := 4 + keyLen + valLen
+	if off+entryLen >= chunkSize || off+entryLen > chunkCap {
+		return 0, false
+	}
+	return entryLen, true
+}
+
+func (b *bucket) entryBytesAtPosLocked(v uint64) ([]byte, []byte, uint64, bool) {
+	entryLen, ok := b.entryLenAtPosLocked(v)
+	if !ok {
+		return nil, nil, 0, false
+	}
+	idx := v & ((1 << bucketSizeBits) - 1)
+	chunk := b.chunks[idx/chunkSize]
+	off := idx % chunkSize
+	kvLenBuf := chunk[off : off+4]
+	keyLen := uint64(kvLenBuf[0])<<8 | uint64(kvLenBuf[1])
+	valLen := uint64(kvLenBuf[2])<<8 | uint64(kvLenBuf[3])
+	keyStart := off + 4
+	valStart := keyStart + keyLen
+	return chunk[keyStart:valStart], chunk[valStart : valStart+valLen], entryLen, true
+}
+
+func (b *bucket) shouldCompactLocked() bool {
+	if b.chunksCount == 0 {
+		return false
+	}
+	if b.liveBytes == 0 {
+		return true
+	}
+	neededChunks := (b.liveBytes + chunkSize - 1) / chunkSize
+	if b.chunksCount <= neededChunks {
+		return false
+	}
+	if b.compactNoop && b.chunksCount*chunkSize == b.compactNoopBytes && b.liveBytes >= b.compactNoopLiveBytes {
+		return false
+	}
+	return true
+}
+
+func (b *bucket) maybeCompactLocked() {
+	if b.shouldCompactLocked() {
+		b.compactLocked()
+	}
+}
+
+func (b *bucket) compactLocked() bool {
+	oldChunks := b.chunks
+	oldChunksCount := b.chunksCount
+	if oldChunksCount == 0 {
+		b.liveBytes = 0
+		return false
+	}
+
+	type entry struct {
+		h        uint64
+		key      []byte
+		val      []byte
+		entryLen uint64
+	}
+	entries := make([]entry, 0, len(b.m))
+	for h, v := range b.m {
+		key, val, entryLen, ok := b.entryBytesAtPosLocked(v)
+		if ok {
+			entries = append(entries, entry{
+				h:        h,
+				key:      key,
+				val:      val,
+				entryLen: entryLen,
+			})
+		}
+	}
+	sort.Slice(entries, func(i, j int) bool {
+		if entries[i].entryLen != entries[j].entryLen {
+			return entries[i].entryLen > entries[j].entryLen
+		}
+		return entries[i].h < entries[j].h
+	})
+
+	newChunks := make([][]byte, len(oldChunks))
+	newM := make(map[uint64]uint64, len(b.m))
+	var newIdx uint64
+	var newBytes uint64
+	for _, e := range entries {
+		off := newIdx % chunkSize
+		if off > 0 && off+e.entryLen >= chunkSize {
+			newIdx = (newIdx/chunkSize + 1) * chunkSize
+			off = 0
+		}
+		chunkIdx := newIdx / chunkSize
+		chunk := newChunks[chunkIdx]
+		if chunk == nil {
+			chunk = getChunk()[:0]
+		}
+		var kvLenBuf [4]byte
+		kvLenBuf[0] = byte(len(e.key) >> 8)
+		kvLenBuf[1] = byte(len(e.key))
+		kvLenBuf[2] = byte(len(e.val) >> 8)
+		kvLenBuf[3] = byte(len(e.val))
+		chunk = append(chunk, kvLenBuf[:]...)
+		chunk = append(chunk, e.key...)
+		chunk = append(chunk, e.val...)
+		newChunks[chunkIdx] = chunk
+		newM[e.h] = newIdx | (b.gen << bucketSizeBits)
+		newIdx += e.entryLen
+		newBytes += e.entryLen
+	}
+
+	newChunksCount := (newIdx + chunkSize - 1) / chunkSize
+	if newChunksCount >= oldChunksCount {
+		for _, chunk := range newChunks {
+			putChunk(chunk)
+		}
+		b.liveBytes = newBytes
+		b.compactNoop = true
+		b.compactNoopBytes = oldChunksCount * chunkSize
+		b.compactNoopLiveBytes = newBytes
+		return false
+	}
+
+	b.chunks = newChunks
+	b.m = newM
+	b.idx = newIdx
+	b.liveBytes = newBytes
+	b.chunksCount = newChunksCount
+	b.compactNoop = false
+	b.compactNoopBytes = 0
+	b.compactNoopLiveBytes = 0
+	for _, chunk := range oldChunks {
+		putChunk(chunk)
+	}
+	return true
 }
 
 func (b *bucket) UpdateStats(s *Stats) {
@@ -337,6 +510,15 @@ func (b *bucket) Set(k, v []byte, h uint64) {
 	b.mu.Lock()
 	chunks := b.chunks
 	needClean := false
+	if oldPos := b.m[h]; oldPos > 0 {
+		if oldLen, ok := b.entryLenAtPosLocked(oldPos); ok {
+			if b.liveBytes >= oldLen {
+				b.liveBytes -= oldLen
+			} else {
+				b.liveBytes = 0
+			}
+		}
+	}
 	idx := b.idx
 	idxNew := idx + kvLen
 	chunkIdx := idx / chunkSize
@@ -362,6 +544,7 @@ func (b *bucket) Set(k, v []byte, h uint64) {
 	if chunk == nil {
 		chunk = getChunk()
 		chunk = chunk[:0]
+		b.chunksCount++
 	}
 	chunk = append(chunk, kvLenBuf[:]...)
 	chunk = append(chunk, k...)
@@ -369,9 +552,11 @@ func (b *bucket) Set(k, v []byte, h uint64) {
 	chunks[chunkIdx] = chunk
 	b.m[h] = idx | (b.gen << bucketSizeBits)
 	b.idx = idxNew
+	b.liveBytes += kvLen
 	if needClean {
 		b.cleanLocked()
 	}
+	b.maybeCompactLocked()
 	b.mu.Unlock()
 }
 
@@ -429,6 +614,16 @@ end:
 
 func (b *bucket) Del(h uint64) {
 	b.mu.Lock()
+	if oldPos := b.m[h]; oldPos > 0 {
+		if oldLen, ok := b.entryLenAtPosLocked(oldPos); ok {
+			if b.liveBytes >= oldLen {
+				b.liveBytes -= oldLen
+			} else {
+				b.liveBytes = 0
+			}
+		}
+	}
 	delete(b.m, h)
+	b.maybeCompactLocked()
 	b.mu.Unlock()
 }

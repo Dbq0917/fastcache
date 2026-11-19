@@ -79,6 +79,8 @@ The cache uses ideas from [BigCache](https://github.com/allegro/bigcache):
 to a single big chunk per bucket.
 Chunks are allocated off-heap if possible. This reduces total memory usage because
 GC collects unused memory more frequently without the need in `GOGC` tweaking.
+Sparse chunks left after deletions or overwrites are compacted by moving their live
+entries into dense chunks, so whole chunks can be released back to the allocator.
 
 
 ### Users

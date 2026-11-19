@@ -284,6 +284,7 @@ func loadBuckets(buckets []bucket, dataPath string, maxChunks uint64) error {
 func (b *bucket) Save(w io.Writer) error {
 	b.mu.Lock()
 	b.cleanLocked()
+	b.maybeCompactLocked()
 	b.mu.Unlock()
 
 	b.mu.RLock()
@@ -409,6 +410,16 @@ func (b *bucket) Load(r io.Reader, maxChunks uint64) error {
 	b.m = m
 	b.idx = bIdx
 	b.gen = bGen
+	b.chunksCount = chunksLen
+	b.liveBytes = 0
+	for _, v := range m {
+		if n, ok := b.entryLenAtPosLocked(v); ok {
+			b.liveBytes += n
+		}
+	}
+	b.compactNoop = false
+	b.compactNoopBytes = 0
+	b.compactNoopLiveBytes = 0
 	b.mu.Unlock()
 
 	return nil
