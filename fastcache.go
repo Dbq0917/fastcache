@@ -109,6 +109,12 @@ func (bs *BigStats) reset() {
 // Call Reset when the cache is no longer needed. This reclaims the allocated
 // memory.
 type Cache struct {
+	// resetGen is the generation of the current cache contents.
+	//
+	// Reset advances it before clearing buckets, so all buckets switch
+	// to the new generation at the same visibility point.
+	resetGen uint64
+
 	buckets [bucketsCount]bucket
 
 	bigStats BigStats
@@ -125,6 +131,7 @@ func New(maxBytes int) *Cache {
 		panic(fmt.Errorf("maxBytes must be greater than 0; got %d", maxBytes))
 	}
 	var c Cache
+	atomic.StoreUint64(&c.resetGen, 1)
 	maxBucketBytes := uint64((maxBytes + bucketsCount - 1) / bucketsCount)
 	for i := range c.buckets[:] {
 		c.buckets[i].Init(maxBucketBytes)
@@ -148,7 +155,13 @@ func New(maxBytes int) *Cache {
 func (c *Cache) Set(k, v []byte) {
 	h := xxhash.Sum64(k)
 	idx := h % bucketsCount
-	c.buckets[idx].Set(k, v, h)
+	b := &c.buckets[idx]
+	for {
+		resetGen := atomic.LoadUint64(&c.resetGen)
+		if b.set(k, v, h, resetGen) {
+			return
+		}
+	}
 }
 
 // Get appends value by the key k to dst and returns the result.
@@ -161,7 +174,8 @@ func (c *Cache) Set(k, v []byte) {
 func (c *Cache) Get(dst, k []byte) []byte {
 	h := xxhash.Sum64(k)
 	idx := h % bucketsCount
-	dst, _ = c.buckets[idx].Get(dst, k, h, true)
+	resetGen := atomic.LoadUint64(&c.resetGen)
+	dst, _ = c.buckets[idx].get(dst, k, h, true, resetGen)
 	return dst
 }
 
@@ -171,14 +185,16 @@ func (c *Cache) Get(dst, k []byte) []byte {
 func (c *Cache) HasGet(dst, k []byte) ([]byte, bool) {
 	h := xxhash.Sum64(k)
 	idx := h % bucketsCount
-	return c.buckets[idx].Get(dst, k, h, true)
+	resetGen := atomic.LoadUint64(&c.resetGen)
+	return c.buckets[idx].get(dst, k, h, true, resetGen)
 }
 
 // Has returns true if entry for the given key k exists in the cache.
 func (c *Cache) Has(k []byte) bool {
 	h := xxhash.Sum64(k)
 	idx := h % bucketsCount
-	_, ok := c.buckets[idx].Get(nil, k, h, false)
+	resetGen := atomic.LoadUint64(&c.resetGen)
+	_, ok := c.buckets[idx].get(nil, k, h, false, resetGen)
 	return ok
 }
 
@@ -188,13 +204,19 @@ func (c *Cache) Has(k []byte) bool {
 func (c *Cache) Del(k []byte) {
 	h := xxhash.Sum64(k)
 	idx := h % bucketsCount
-	c.buckets[idx].Del(h)
+	resetGen := atomic.LoadUint64(&c.resetGen)
+	c.buckets[idx].del(h, resetGen)
 }
 
 // Reset removes all the items from the cache.
+//
+// The reset becomes visible atomically for all buckets. Concurrent reads
+// never observe a mixture of old and reset buckets, while concurrent writes
+// continue into the new generation without being blocked by the reset.
 func (c *Cache) Reset() {
+	resetGen := atomic.AddUint64(&c.resetGen, 1)
 	for i := range c.buckets[:] {
-		c.buckets[i].Reset()
+		c.buckets[i].reset(resetGen)
 	}
 	c.bigStats.reset()
 }
@@ -231,6 +253,9 @@ type bucket struct {
 	// gen is the generation of chunks.
 	gen uint64
 
+	// resetGen is the cache reset generation for the bucket contents.
+	resetGen uint64
+
 	// idx points to chunks for writing the next (k, v) pair.
 	idx uint64
 
@@ -248,11 +273,25 @@ func (b *bucket) Init(maxBytes uint64) {
 	maxChunks := (maxBytes + chunkSize - 1) / chunkSize
 	b.chunks = make([][]byte, maxChunks)
 	b.m = make(map[uint64]uint64)
-	b.Reset()
+	b.resetLocked(1)
 }
 
 func (b *bucket) Reset() {
 	b.mu.Lock()
+	b.resetLocked(b.resetGen + 1)
+	b.mu.Unlock()
+}
+
+func (b *bucket) reset(resetGen uint64) {
+	b.mu.Lock()
+	b.resetLocked(resetGen)
+	b.mu.Unlock()
+}
+
+func (b *bucket) resetLocked(resetGen uint64) {
+	if b.resetGen >= resetGen {
+		return
+	}
 	chunks := b.chunks
 	for i := range chunks {
 		putChunk(chunks[i])
@@ -261,12 +300,12 @@ func (b *bucket) Reset() {
 	b.m = make(map[uint64]uint64)
 	b.idx = 0
 	b.gen = 1
+	b.resetGen = resetGen
 	atomic.StoreUint64(&b.getCalls, 0)
 	atomic.StoreUint64(&b.setCalls, 0)
 	atomic.StoreUint64(&b.misses, 0)
 	atomic.StoreUint64(&b.collisions, 0)
 	atomic.StoreUint64(&b.corruptions, 0)
-	b.mu.Unlock()
 }
 
 func (b *bucket) cleanLocked() {
@@ -316,11 +355,15 @@ func (b *bucket) UpdateStats(s *Stats) {
 }
 
 func (b *bucket) Set(k, v []byte, h uint64) {
+	b.set(k, v, h, b.resetGen)
+}
+
+func (b *bucket) set(k, v []byte, h, resetGen uint64) bool {
 	atomic.AddUint64(&b.setCalls, 1)
 	if len(k) >= (1<<16) || len(v) >= (1<<16) {
 		// Too big key or value - its length cannot be encoded
 		// with 2 bytes (see below). Skip the entry.
-		return
+		return true
 	}
 	var kvLenBuf [4]byte
 	kvLenBuf[0] = byte(uint16(len(k)) >> 8)
@@ -331,10 +374,15 @@ func (b *bucket) Set(k, v []byte, h uint64) {
 	if kvLen >= chunkSize {
 		// Do not store too big keys and values, since they do not
 		// fit a chunk.
-		return
+		return true
 	}
 
 	b.mu.Lock()
+	b.resetLocked(resetGen)
+	if b.resetGen != resetGen {
+		b.mu.Unlock()
+		return false
+	}
 	chunks := b.chunks
 	needClean := false
 	idx := b.idx
@@ -373,12 +421,22 @@ func (b *bucket) Set(k, v []byte, h uint64) {
 		b.cleanLocked()
 	}
 	b.mu.Unlock()
+	return true
 }
 
 func (b *bucket) Get(dst, k []byte, h uint64, returnDst bool) ([]byte, bool) {
+	return b.get(dst, k, h, returnDst, b.resetGen)
+}
+
+func (b *bucket) get(dst, k []byte, h uint64, returnDst bool, resetGen uint64) ([]byte, bool) {
 	b.mu.RLock()
 	atomic.AddUint64(&b.getCalls, 1)
 	found := false
+	if b.resetGen != resetGen {
+		b.mu.RUnlock()
+		atomic.AddUint64(&b.misses, 1)
+		return dst, false
+	}
 	chunks := b.chunks
 	v := b.m[h]
 	bGen := b.gen & ((1 << genSizeBits) - 1)
@@ -428,7 +486,16 @@ end:
 }
 
 func (b *bucket) Del(h uint64) {
+	b.del(h, b.resetGen)
+}
+
+func (b *bucket) del(h uint64, resetGen uint64) {
 	b.mu.Lock()
+	b.resetLocked(resetGen)
+	if b.resetGen != resetGen {
+		b.mu.Unlock()
+		return
+	}
 	delete(b.m, h)
 	b.mu.Unlock()
 }

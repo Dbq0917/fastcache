@@ -4,8 +4,11 @@ import (
 	"fmt"
 	"runtime"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
+
+	xxhash "github.com/cespare/xxhash/v2"
 )
 
 func TestCacheSmall(t *testing.T) {
@@ -284,4 +287,162 @@ func TestCacheResetUpdateStatsSetConcurrent(t *testing.T) {
 	close(stopCh)
 	statsWG.Wait()
 	resettersWG.Wait()
+}
+
+func TestCacheResetAtomicVisibilityDuringConcurrentReads(t *testing.T) {
+	c := New(1)
+	defer c.Reset()
+
+	var earlyKey, lateKey, lateOtherKey []byte
+	for i := 0; earlyKey == nil || lateKey == nil || lateOtherKey == nil; i++ {
+		k := []byte(fmt.Sprintf("key-%d", i))
+		switch xxhash.Sum64(k) % bucketsCount {
+		case 0:
+			earlyKey = k
+		case bucketsCount - 1:
+			if lateKey == nil {
+				lateKey = k
+			} else if lateOtherKey == nil {
+				lateOtherKey = k
+			}
+		}
+	}
+	earlyValue := []byte("early-value")
+	lateValue := []byte("late-value")
+	lateOtherValue := []byte("late-other-value")
+	c.Set(earlyKey, earlyValue)
+	c.Set(lateKey, lateValue)
+	c.Set(lateOtherKey, lateOtherValue)
+	if v, ok := c.HasGet(nil, earlyKey); !ok || string(v) != string(earlyValue) {
+		t.Fatalf("cannot read early key before reset; got %q; ok=%v", v, ok)
+	}
+	if v, ok := c.HasGet(nil, lateKey); !ok || string(v) != string(lateValue) {
+		t.Fatalf("cannot read late key before reset; got %q; ok=%v", v, ok)
+	}
+	if v, ok := c.HasGet(nil, lateOtherKey); !ok || string(v) != string(lateOtherValue) {
+		t.Fatalf("cannot read other late key before reset; got %q; ok=%v", v, ok)
+	}
+
+	startGen := atomic.LoadUint64(&c.resetGen)
+	lateBucket := &c.buckets[bucketsCount-1]
+	pauseBucket := &c.buckets[1]
+	pauseBucket.mu.RLock()
+	pauseBucketLocked := true
+	resetDone := make(chan struct{})
+	go func() {
+		c.Reset()
+		close(resetDone)
+	}()
+	defer func() {
+		if pauseBucketLocked {
+			pauseBucket.mu.RUnlock()
+		}
+		select {
+		case <-resetDone:
+		case <-time.After(5 * time.Second):
+			t.Errorf("reset did not finish")
+		}
+	}()
+
+	deadline := time.Now().Add(5 * time.Second)
+	for atomic.LoadUint64(&c.resetGen) == startGen {
+		if time.Now().After(deadline) {
+			t.Fatalf("reset did not advance the cache generation")
+		}
+		runtime.Gosched()
+	}
+	for {
+		earlyBucket := &c.buckets[0]
+		earlyBucket.mu.RLock()
+		earlyReset := earlyBucket.resetGen != startGen
+		earlyBucket.mu.RUnlock()
+		if earlyReset {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("reset did not clear the first bucket")
+		}
+		runtime.Gosched()
+	}
+	if pauseBucket.resetGen != startGen {
+		t.Fatalf("pause bucket was reset before the test could observe it; resetGen=%d; startGen=%d", pauseBucket.resetGen, startGen)
+	}
+	if lateBucket.resetGen != startGen {
+		t.Fatalf("late bucket was reset before the test could observe it; resetGen=%d; startGen=%d", lateBucket.resetGen, startGen)
+	}
+
+	errCh := make(chan error, 1)
+	stopCh := make(chan struct{})
+	var reads uint64
+	var readersWG sync.WaitGroup
+	for range 4 {
+		readersWG.Add(1)
+		go func() {
+			defer readersWG.Done()
+			for {
+				select {
+				case <-stopCh:
+					return
+				default:
+				}
+				for _, k := range [][]byte{earlyKey, lateKey, lateOtherKey} {
+					if _, ok := c.HasGet(nil, k); ok {
+						select {
+						case errCh <- fmt.Errorf("key %q is readable after reset became visible", k):
+						default:
+						}
+						return
+					}
+					atomic.AddUint64(&reads, 1)
+				}
+			}
+		}()
+	}
+	for atomic.LoadUint64(&reads) < 10000 {
+		if time.Now().After(deadline) {
+			close(stopCh)
+			readersWG.Wait()
+			t.Fatalf("concurrent readers did not make progress during reset")
+		}
+		runtime.Gosched()
+	}
+	close(stopCh)
+	readersWG.Wait()
+	select {
+	case err := <-errCh:
+		t.Fatal(err)
+	default:
+	}
+
+	newEarlyValue := []byte("new-early-value")
+	c.Set(earlyKey, newEarlyValue)
+	if v, ok := c.HasGet(nil, earlyKey); !ok || string(v) != string(newEarlyValue) {
+		t.Fatalf("write to the reset bucket was lost; got %q; ok=%v", v, ok)
+	}
+	newLateValue := []byte("new-late-value")
+	c.Set(lateKey, newLateValue)
+	if v, ok := c.HasGet(nil, lateKey); !ok || string(v) != string(newLateValue) {
+		t.Fatalf("write to the unreset bucket was lost; got %q; ok=%v", v, ok)
+	}
+	if v, ok := c.HasGet(nil, lateOtherKey); ok || len(v) != 0 {
+		t.Fatalf("old late key is readable after switching the bucket generation; got %q; ok=%v", v, ok)
+	}
+
+	pauseBucket.mu.RUnlock()
+	pauseBucketLocked = false
+	select {
+	case <-resetDone:
+	case <-time.After(5 * time.Second):
+		t.Fatalf("reset did not finish after the late bucket was unblocked")
+	}
+
+	if v, ok := c.HasGet(nil, lateKey); !ok || string(v) != string(newLateValue) {
+		t.Fatalf("write to the unreset bucket was lost by reset; got %q; ok=%v", v, ok)
+	}
+	if v, ok := c.HasGet(nil, lateOtherKey); ok || len(v) != 0 {
+		t.Fatalf("old late key is readable after reset; got %q; ok=%v", v, ok)
+	}
+	if v, ok := c.HasGet(nil, earlyKey); !ok || string(v) != string(newEarlyValue) {
+		t.Fatalf("write during reset was lost; got %q; ok=%v", v, ok)
+	}
 }

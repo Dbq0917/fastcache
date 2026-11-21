@@ -163,6 +163,7 @@ func load(filePath string, maxBytes int) (*Cache, error) {
 	results := make(chan error)
 	workersCount := 0
 	var c Cache
+	c.resetGen = 1
 	for _, fi := range fis {
 		fn := fi.Name()
 		if fi.IsDir() || !dataFileRegexp.MatchString(fn) {
@@ -191,6 +192,7 @@ func load(filePath string, maxBytes int) (*Cache, error) {
 		if len(b.chunks) == 0 {
 			b.chunks = make([][]byte, maxBucketChunks)
 			b.m = make(map[uint64]uint64)
+			b.resetGen = c.resetGen
 		}
 	}
 	return &c, nil
@@ -409,6 +411,7 @@ func (b *bucket) Load(r io.Reader, maxChunks uint64) error {
 	b.m = m
 	b.idx = bIdx
 	b.gen = bGen
+	b.resetGen = 1
 	b.mu.Unlock()
 
 	return nil
