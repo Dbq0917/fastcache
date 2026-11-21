@@ -56,3 +56,33 @@ func createValue(size, seed int) []byte {
 	}
 	return buf
 }
+
+func TestSetAndSetBigStatsTotal(t *testing.T) {
+	c := New(256 * 1024 * 1024)
+	defer c.Reset()
+
+	const setCalls = 1000
+	const setBigCalls = 500
+	for i := range setCalls {
+		k := []byte(fmt.Sprintf("key %d", i))
+		v := []byte(fmt.Sprintf("value %d", i))
+		c.Set(k, v)
+	}
+	for i := range setBigCalls {
+		k := []byte(fmt.Sprintf("big key %d", i))
+		// Use values bigger than 64KB, so SetBig splits them into
+		// multiple subvalues stored via the regular Set path.
+		// These internal writes must not be counted as Set calls.
+		v := createValue(100+2*chunkSize, i)
+		c.SetBig(k, v)
+	}
+
+	var s Stats
+	c.UpdateStats(&s)
+	if s.SetBigCalls != setBigCalls {
+		t.Fatalf("unexpected number of SetBigCalls; got %d; want %d", s.SetBigCalls, setBigCalls)
+	}
+	if s.SetCalls != setCalls+setBigCalls {
+		t.Fatalf("unexpected number of SetCalls; got %d; want %d", s.SetCalls, setCalls+setBigCalls)
+	}
+}

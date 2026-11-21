@@ -31,6 +31,9 @@ type Stats struct {
 	GetCalls uint64
 
 	// SetCalls is the number of Set calls.
+	//
+	// It includes the number of SetBig calls, so writes
+	// via both entries are covered by this counter.
 	SetCalls uint64
 
 	// Misses is the number of cache misses.
@@ -71,6 +74,8 @@ type BigStats struct {
 	GetBigCalls uint64
 
 	// SetBigCalls is the number of SetBig calls.
+	//
+	// It is also included into SetCalls.
 	SetBigCalls uint64
 
 	// TooBigKeyErrors is the number of calls to SetBig with too big key.
@@ -148,6 +153,17 @@ func New(maxBytes int) *Cache {
 func (c *Cache) Set(k, v []byte) {
 	h := xxhash.Sum64(k)
 	idx := h % bucketsCount
+	atomic.AddUint64(&c.buckets[idx].setCalls, 1)
+	c.buckets[idx].Set(k, v, h)
+}
+
+// set stores (k, v) in the cache without updating SetCalls stats.
+// It is used by SetBig for storing subvalues and the metavalue,
+// which must be counted as a single SetBig call instead of
+// multiple Set calls.
+func (c *Cache) set(k, v []byte) {
+	h := xxhash.Sum64(k)
+	idx := h % bucketsCount
 	c.buckets[idx].Set(k, v, h)
 }
 
@@ -207,7 +223,9 @@ func (c *Cache) UpdateStats(s *Stats) {
 		c.buckets[i].UpdateStats(s)
 	}
 	s.GetBigCalls += atomic.LoadUint64(&c.bigStats.GetBigCalls)
-	s.SetBigCalls += atomic.LoadUint64(&c.bigStats.SetBigCalls)
+	setBigCalls := atomic.LoadUint64(&c.bigStats.SetBigCalls)
+	s.SetBigCalls += setBigCalls
+	s.SetCalls += setBigCalls
 	s.TooBigKeyErrors += atomic.LoadUint64(&c.bigStats.TooBigKeyErrors)
 	s.InvalidMetavalueErrors += atomic.LoadUint64(&c.bigStats.InvalidMetavalueErrors)
 	s.InvalidValueLenErrors += atomic.LoadUint64(&c.bigStats.InvalidValueLenErrors)
@@ -316,7 +334,6 @@ func (b *bucket) UpdateStats(s *Stats) {
 }
 
 func (b *bucket) Set(k, v []byte, h uint64) {
-	atomic.AddUint64(&b.setCalls, 1)
 	if len(k) >= (1<<16) || len(v) >= (1<<16) {
 		// Too big key or value - its length cannot be encoded
 		// with 2 bytes (see below). Skip the entry.

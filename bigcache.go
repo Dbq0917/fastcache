@@ -55,13 +55,13 @@ func (c *Cache) SetBig(k, v []byte) {
 		}
 		subvalue := v[:subvalueLen]
 		v = v[subvalueLen:]
-		c.Set(subkey.B, subvalue)
+		c.set(subkey.B, subvalue)
 	}
 
 	// Write metavalue, which consists of valueHash and valueLen.
 	subkey.B = marshalUint64(subkey.B[:0], valueHash)
 	subkey.B = marshalUint64(subkey.B, uint64(valueLen))
-	c.Set(k, subkey.B)
+	c.set(k, subkey.B)
 	putSubkeyBuf(subkey)
 }
 
