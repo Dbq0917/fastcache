@@ -112,6 +112,10 @@ type Cache struct {
 	buckets [bucketsCount]bucket
 
 	bigStats BigStats
+
+	// verifyBigHashes is set for caches loaded from files, where chunk contents
+	// aren't guaranteed to be intact.
+	verifyBigHashes bool
 }
 
 // New returns new cache with the given maxBytes capacity in bytes.
@@ -386,6 +390,7 @@ func (b *bucket) Get(dst, k []byte, h uint64, returnDst bool) ([]byte, bool) {
 		gen := v >> bucketSizeBits
 		idx := v & ((1 << bucketSizeBits) - 1)
 		if gen == bGen && idx < b.idx || gen+1 == bGen && idx >= b.idx || gen == maxGen && bGen == 1 && idx >= b.idx {
+			entryIdx := idx
 			chunkIdx := idx / chunkSize
 			if chunkIdx >= uint64(len(chunks)) {
 				// Corrupted data during the load from file. Just skip it.
@@ -395,6 +400,19 @@ func (b *bucket) Get(dst, k []byte, h uint64, returnDst bool) ([]byte, bool) {
 			chunk := chunks[chunkIdx]
 			idx %= chunkSize
 			if idx+4 >= chunkSize {
+				var kvLenBuf [4]byte
+				if readChunksAt(chunks, entryIdx, kvLenBuf[:]) {
+					keyLen := (uint64(kvLenBuf[0]) << 8) | uint64(kvLenBuf[1])
+					valLen := (uint64(kvLenBuf[2]) << 8) | uint64(kvLenBuf[3])
+					if valLen == bigValueLenMarker || valLen == bigSegmentedMarker {
+						if keyLen == uint64(len(k)) && equalChunksAt(chunks, entryIdx+bigEntryHeaderLen, k) {
+							found = true
+						} else {
+							atomic.AddUint64(&b.collisions, 1)
+						}
+						goto end
+					}
+				}
 				// Corrupted data during the load from file. Just skip it.
 				atomic.AddUint64(&b.corruptions, 1)
 				goto end
@@ -403,6 +421,14 @@ func (b *bucket) Get(dst, k []byte, h uint64, returnDst bool) ([]byte, bool) {
 			keyLen := (uint64(kvLenBuf[0]) << 8) | uint64(kvLenBuf[1])
 			valLen := (uint64(kvLenBuf[2]) << 8) | uint64(kvLenBuf[3])
 			idx += 4
+			if valLen == bigValueLenMarker || valLen == bigSegmentedMarker {
+				if keyLen == uint64(len(k)) && equalChunksAt(chunks, entryIdx+bigEntryHeaderLen, k) {
+					found = true
+				} else {
+					atomic.AddUint64(&b.collisions, 1)
+				}
+				goto end
+			}
 			if idx+keyLen+valLen >= chunkSize {
 				// Corrupted data during the load from file. Just skip it.
 				atomic.AddUint64(&b.corruptions, 1)

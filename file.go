@@ -193,6 +193,7 @@ func load(filePath string, maxBytes int) (*Cache, error) {
 			b.m = make(map[uint64]uint64)
 		}
 	}
+	c.verifyBigHashes = true
 	return &c, nil
 }
 

@@ -80,6 +80,10 @@ to a single big chunk per bucket.
 Chunks are allocated off-heap if possible. This reduces total memory usage because
 GC collects unused memory more frequently without the need in `GOGC` tweaking.
 
+Values stored via `SetBig` are placed as one contiguous multi-chunk record when they
+fit a single bucket. Values exceeding the bucket capacity are split into a small number
+of bucket-local records, avoiding one cache lookup per 64KB chunk.
+
 
 ### Users
 
