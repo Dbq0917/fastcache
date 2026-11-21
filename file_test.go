@@ -77,7 +77,7 @@ func testSaveLoadFile(t *testing.T, concurrency int) {
 	defer os.RemoveAll(filePath)
 
 	const itemsCount = 10000
-	const maxBytes = bucketsCount * chunkSize * 2
+	maxBytes := bucketsCount * chunkSize * 2
 	c := New(maxBytes)
 	for i := range itemsCount {
 		k := []byte(fmt.Sprintf("key %d", i))

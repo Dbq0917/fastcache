@@ -69,10 +69,13 @@ func TestCacheSmall(t *testing.T) {
 }
 
 func TestCacheWrap(t *testing.T) {
-	c := New(bucketsCount * chunkSize * 1.5)
+	c := New(bucketsCount * chunkSize * 3 / 2)
 	defer c.Reset()
 
-	calls := uint64(5e6)
+	// Scale the number of calls with the buckets count, so the test
+	// works for any bucketsCount value. The cache capacity is
+	// proportional to bucketsCount, so must be the workload.
+	calls := uint64(5e6) * uint64(bucketsCount) / 512
 
 	for i := range calls {
 		k := []byte(fmt.Sprintf("key %d", i))
@@ -114,8 +117,8 @@ func TestCacheWrap(t *testing.T) {
 	if s.BytesSize < 1024 {
 		t.Fatalf("unexpected BytesSize; got %d; cannot be smaller than %d", s.BytesSize, 1024)
 	}
-	if s.MaxBytesSize < 32*1024*1024 {
-		t.Fatalf("unexpected MaxBytesSize; got %d; cannot be smaller than %d", s.MaxBytesSize, 32*1024*1024)
+	if minMaxBytesSize := uint64(bucketsCount) * chunkSize; s.MaxBytesSize < minMaxBytesSize {
+		t.Fatalf("unexpected MaxBytesSize; got %d; cannot be smaller than %d", s.MaxBytesSize, minMaxBytesSize)
 	}
 }
 

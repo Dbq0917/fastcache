@@ -115,11 +115,11 @@ func (c *Cache) save(dir string, workersCount int) error {
 	results := make(chan error)
 	for i := range workersCount {
 		go func(workerNum int) {
-			results <- saveBuckets(c.buckets[:], workCh, dir, workerNum)
+			results <- saveBuckets(c.buckets, workCh, dir, workerNum)
 		}(i)
 	}
 	// Feed workers with work
-	for i := range c.buckets[:] {
+	for i := range c.buckets {
 		workCh <- i
 	}
 	close(workCh)
@@ -162,7 +162,9 @@ func load(filePath string, maxBytes int) (*Cache, error) {
 	}
 	results := make(chan error)
 	workersCount := 0
-	var c Cache
+	c := Cache{
+		buckets: make([]bucket, bucketsCount),
+	}
 	for _, fi := range fis {
 		fn := fi.Name()
 		if fi.IsDir() || !dataFileRegexp.MatchString(fn) {
@@ -170,7 +172,7 @@ func load(filePath string, maxBytes int) (*Cache, error) {
 		}
 		workersCount++
 		go func(dataPath string) {
-			results <- loadBuckets(c.buckets[:], dataPath, maxBucketChunks)
+			results <- loadBuckets(c.buckets, dataPath, maxBucketChunks)
 		}(filePath + "/" + fn)
 	}
 	err = nil
@@ -186,7 +188,7 @@ func load(filePath string, maxBytes int) (*Cache, error) {
 	// Initialize buckets, which could be missing due to incomplete or corrupted files in the cache.
 	// It is better initializing such buckets instead of returning error, since the rest of buckets
 	// contain valid data.
-	for i := range c.buckets[:] {
+	for i := range c.buckets {
 		b := &c.buckets[i]
 		if len(b.chunks) == 0 {
 			b.chunks = make([][]byte, maxBucketChunks)

@@ -4,15 +4,18 @@ import (
 	"bytes"
 	"strconv"
 	"testing"
+
+	xxhash "github.com/cespare/xxhash/v2"
 )
 
 func TestGenerationOverflow(t *testing.T) {
 	c := New(1) // each bucket has 64 *1024 bytes capacity
 
 	// Initial generation is 1
-	genVal(t, c, 1)
+	bucketIdx := uint64(0)
+	genVal(t, c, bucketIdx, 1)
 
-	// These two keys has to the same bucket (100), so we can push the
+	// These two keys has to the same bucket, so we can push the
 	// generations up much faster.  The keys and values are sized so that
 	// every time we push them into the cache they will completely fill the
 	// bucket
@@ -26,6 +29,10 @@ func TestGenerationOverflow(t *testing.T) {
 	for i := range bigVal2 {
 		bigVal2[i] = 2
 	}
+	bucketIdx = xxhash.Sum64(key1) & bucketsMask
+	if idx2 := xxhash.Sum64(key2) & bucketsMask; idx2 != bucketIdx {
+		t.Fatalf("key1 and key2 must belong to the same bucket; got buckets %d and %d", bucketIdx, idx2)
+	}
 
 	// Do some initial Set/Get demonstrate that this works
 	for i := range 10 {
@@ -33,14 +40,14 @@ func TestGenerationOverflow(t *testing.T) {
 		c.Set(key2, bigVal2)
 		getVal(t, c, key1, bigVal1)
 		getVal(t, c, key2, bigVal2)
-		genVal(t, c, uint64(1+i))
+		genVal(t, c, bucketIdx, uint64(1+i))
 	}
 
 	// This is a hack to simulate calling Set 2^24-3 times
 	// Actually doing this takes ~24 seconds, making the test slow
-	c.buckets[100].gen = (1 << 24) - 2
+	c.buckets[bucketIdx].gen = (1 << 24) - 2
 
-	// c.buckets[100].gen == 16,777,215
+	// c.buckets[bucketIdx].gen == 16,777,215
 	// Set/Get still works
 
 	c.Set(key1, bigVal1)
@@ -49,10 +56,10 @@ func TestGenerationOverflow(t *testing.T) {
 	getVal(t, c, key1, bigVal1)
 	getVal(t, c, key2, bigVal2)
 
-	genVal(t, c, (1<<24)-1)
+	genVal(t, c, bucketIdx, (1<<24)-1)
 
 	// After the next Set operations
-	// c.buckets[100].gen == 16,777,216
+	// c.buckets[bucketIdx].gen == 16,777,216
 
 	// This set creates an index where `idx | (b.gen << bucketSizeBits)` == 0
 	// The value is in the cache but is unreadable by Get
@@ -70,7 +77,7 @@ func TestGenerationOverflow(t *testing.T) {
 	// Ensure generations are working as we expect
 	// NB: Here we skip the 2^24 generation, because the bucket carefully
 	// avoids `generation==0`
-	genVal(t, c, (1<<24)+1)
+	genVal(t, c, bucketIdx, (1<<24)+1)
 
 	getVal(t, c, key1, bigVal1)
 	getVal(t, c, key2, bigVal2)
@@ -81,7 +88,7 @@ func TestGenerationOverflow(t *testing.T) {
 		c.Set(key2, bigVal2)
 		getVal(t, c, key1, bigVal1)
 		getVal(t, c, key2, bigVal2)
-		genVal(t, c, uint64((1<<24)+2+i))
+		genVal(t, c, bucketIdx, uint64((1<<24)+2+i))
 	}
 }
 
@@ -93,9 +100,9 @@ func getVal(t *testing.T, c *Cache, key, expected []byte) {
 	}
 }
 
-func genVal(t *testing.T, c *Cache, expected uint64) {
+func genVal(t *testing.T, c *Cache, bucketIdx uint64, expected uint64) {
 	t.Helper()
-	actual := c.buckets[100].gen
+	actual := c.buckets[bucketIdx].gen
 	// Ensure generations are working as we expect
 	if actual != expected {
 		t.Fatalf("Expected generation to be %d found %d instead", expected, actual)

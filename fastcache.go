@@ -5,13 +5,48 @@ package fastcache
 
 import (
 	"fmt"
+	"runtime"
 	"sync"
 	"sync/atomic"
 
 	xxhash "github.com/cespare/xxhash/v2"
 )
 
-const bucketsCount = 512
+// bucketsCount is the number of buckets (shards) in the cache.
+//
+// It is chosen once at program startup according to the number of CPUs
+// available to the process (GOMAXPROCS, which reflects CPU limits imposed
+// on the process, e.g. by cgroups): 32 buckets per available CPU,
+// rounded up to a power of two and capped at 512.
+//
+// The value never changes during the process lifetime, so the mapping
+// hash(key) -> bucket remains stable and stored data cannot end up
+// in a wrong bucket. Keeping the value a power of two allows substituting
+// an integer division with a bitmask on the hot path - see bucketsMask.
+var bucketsCount = calcBucketsCount()
+
+// bucketsMask is used for mapping hash(key) to the bucket index
+// without an integer division on the hot path.
+var bucketsMask = uint64(bucketsCount - 1)
+
+func calcBucketsCount() int {
+	n := runtime.GOMAXPROCS(0)
+	// Round up n to the nearest power of two.
+	p := 1
+	for p < n {
+		p <<= 1
+	}
+	// Use 32 buckets per available CPU, so concurrent goroutines
+	// rarely contend on the same bucket lock, while the number of
+	// buckets stays proportional to the available CPU resources.
+	p *= 32
+	// Cap the result, since too many buckets waste memory on per-bucket
+	// locks, maps and stats and thrash CPU caches.
+	if p > 512 {
+		p = 512
+	}
+	return p
+}
 
 const chunkSize = 64 * 1024
 
@@ -109,7 +144,7 @@ func (bs *BigStats) reset() {
 // Call Reset when the cache is no longer needed. This reclaims the allocated
 // memory.
 type Cache struct {
-	buckets [bucketsCount]bucket
+	buckets []bucket
 
 	bigStats BigStats
 }
@@ -124,9 +159,11 @@ func New(maxBytes int) *Cache {
 	if maxBytes <= 0 {
 		panic(fmt.Errorf("maxBytes must be greater than 0; got %d", maxBytes))
 	}
-	var c Cache
+	c := Cache{
+		buckets: make([]bucket, bucketsCount),
+	}
 	maxBucketBytes := uint64((maxBytes + bucketsCount - 1) / bucketsCount)
-	for i := range c.buckets[:] {
+	for i := range c.buckets {
 		c.buckets[i].Init(maxBucketBytes)
 	}
 	return &c
@@ -147,7 +184,7 @@ func New(maxBytes int) *Cache {
 // k and v contents may be modified after returning from Set.
 func (c *Cache) Set(k, v []byte) {
 	h := xxhash.Sum64(k)
-	idx := h % bucketsCount
+	idx := h & bucketsMask
 	c.buckets[idx].Set(k, v, h)
 }
 
@@ -160,7 +197,7 @@ func (c *Cache) Set(k, v []byte) {
 // k contents may be modified after returning from Get.
 func (c *Cache) Get(dst, k []byte) []byte {
 	h := xxhash.Sum64(k)
-	idx := h % bucketsCount
+	idx := h & bucketsMask
 	dst, _ = c.buckets[idx].Get(dst, k, h, true)
 	return dst
 }
@@ -170,14 +207,14 @@ func (c *Cache) Get(dst, k []byte) []byte {
 // stored nil/empty value versus and non-existing value.
 func (c *Cache) HasGet(dst, k []byte) ([]byte, bool) {
 	h := xxhash.Sum64(k)
-	idx := h % bucketsCount
+	idx := h & bucketsMask
 	return c.buckets[idx].Get(dst, k, h, true)
 }
 
 // Has returns true if entry for the given key k exists in the cache.
 func (c *Cache) Has(k []byte) bool {
 	h := xxhash.Sum64(k)
-	idx := h % bucketsCount
+	idx := h & bucketsMask
 	_, ok := c.buckets[idx].Get(nil, k, h, false)
 	return ok
 }
@@ -187,13 +224,13 @@ func (c *Cache) Has(k []byte) bool {
 // k contents may be modified after returning from Del.
 func (c *Cache) Del(k []byte) {
 	h := xxhash.Sum64(k)
-	idx := h % bucketsCount
+	idx := h & bucketsMask
 	c.buckets[idx].Del(h)
 }
 
 // Reset removes all the items from the cache.
 func (c *Cache) Reset() {
-	for i := range c.buckets[:] {
+	for i := range c.buckets {
 		c.buckets[i].Reset()
 	}
 	c.bigStats.reset()
@@ -203,7 +240,7 @@ func (c *Cache) Reset() {
 //
 // Call s.Reset before calling UpdateStats if s is re-used.
 func (c *Cache) UpdateStats(s *Stats) {
-	for i := range c.buckets[:] {
+	for i := range c.buckets {
 		c.buckets[i].UpdateStats(s)
 	}
 	s.GetBigCalls += atomic.LoadUint64(&c.bigStats.GetBigCalls)
